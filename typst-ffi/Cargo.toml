@@ -10,9 +10,11 @@ crate-type = ["staticlib"]
 typst = "0.14"
 typst-pdf = "0.14"
 typst-assets = { version = "0.14", features = ["fonts"] }
-comemo = "0.4"
 chrono = "0.4"
 
 [profile.release]
-opt-level = 2
+opt-level = 3
 lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

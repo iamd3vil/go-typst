@@ -33,8 +33,8 @@ import (
 type CompileOption func(*compileConfig)
 
 type compileConfig struct {
-	root       string
-	packageDir string
+	root       string // directory for resolving #import and #image paths
+	packageDir string // directory for resolving @preview/... package imports
 }
 
 // WithRoot sets the root directory for resolving local file imports and images.
@@ -54,22 +54,33 @@ func WithPackageDir(dir string) CompileOption {
 	}
 }
 
+var defaultPkgDir struct {
+	once sync.Once
+	dir  string
+}
+
 // DefaultPackageDir returns the platform-specific default Typst package cache directory.
 // On Linux: ~/.cache/typst/packages/
 // On macOS: ~/Library/Caches/typst/packages/
+// The result is computed once and cached for the lifetime of the process.
 func DefaultPackageDir() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	if runtime.GOOS == "darwin" {
-		return filepath.Join(home, "Library", "Caches", "typst", "packages")
-	}
-	// Linux and others: respect XDG_CACHE_HOME if set.
-	if cacheDir := os.Getenv("XDG_CACHE_HOME"); cacheDir != "" {
-		return filepath.Join(cacheDir, "typst", "packages")
-	}
-	return filepath.Join(home, ".cache", "typst", "packages")
+	defaultPkgDir.once.Do(func() {
+		home, err := os.UserHomeDir()
+		if err != nil {
+			return
+		}
+		if runtime.GOOS == "darwin" {
+			defaultPkgDir.dir = filepath.Join(home, "Library", "Caches", "typst", "packages")
+			return
+		}
+		// Linux and others: respect XDG_CACHE_HOME if set.
+		if cacheDir := os.Getenv("XDG_CACHE_HOME"); cacheDir != "" {
+			defaultPkgDir.dir = filepath.Join(cacheDir, "typst", "packages")
+			return
+		}
+		defaultPkgDir.dir = filepath.Join(home, ".cache", "typst", "packages")
+	})
+	return defaultPkgDir.dir
 }
 
 // CompileError represents a Typst compilation error.
@@ -86,14 +97,14 @@ func (e *CompileError) Error() string {
 //
 // Create with [New] and free with [Compiler.Close].
 type Compiler struct {
-	world  *C.TypstWorld
-	once   sync.Once
-	closed bool
+	world  *C.TypstWorld // pointer to Rust-allocated SharedResources (fonts + stdlib)
+	once   sync.Once     // ensures free() runs at most once
+	closed bool          // prevents compile after Close
 }
 
-// New creates a new Compiler. The bundled default fonts (Libertinus Serif,
-// New Computer Modern, DejaVu Sans Mono) are always loaded. Any additional
-// font bytes (ttf/otf) passed here are loaded on top.
+// New creates a new Compiler. Bundled fonts (Libertinus Serif,
+// New Computer Modern, DejaVu Sans Mono) are always loaded.
+// Any additional font bytes (ttf/otf) are loaded on top.
 //
 // Multiple Compilers are fully independent — different fonts, no shared
 // locks, no contention.
@@ -104,6 +115,7 @@ func New(fonts ...[]byte) (*Compiler, error) {
 		world = C.typst_world_new(nil, nil, 0)
 	} else {
 		n := len(fonts)
+		// Allocate C arrays to pass font pointers and lengths across the FFI boundary.
 		cPtrs := (*[1 << 30]*C.uint8_t)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof((*C.uint8_t)(nil)))))[:n:n]
 		cLens := (*[1 << 30]C.size_t)(C.malloc(C.size_t(n) * C.size_t(unsafe.Sizeof(C.size_t(0)))))[:n:n]
 		defer C.free(unsafe.Pointer(&cPtrs[0]))
@@ -131,6 +143,7 @@ func New(fonts ...[]byte) (*Compiler, error) {
 	}
 
 	c := &Compiler{world: world}
+	// Safety net: if caller forgets Close(), the GC will eventually free Rust memory.
 	runtime.SetFinalizer(c, (*Compiler).free)
 	return c, nil
 }
@@ -175,6 +188,7 @@ func (c *Compiler) CompileFile(path string, opts ...CompileOption) (*Document, e
 	return c.compile(source, allOpts)
 }
 
+// compile is the shared implementation for Compile, CompileBytes, and CompileFile.
 func (c *Compiler) compile(source []byte, opts []CompileOption) (*Document, error) {
 	if c.closed {
 		return nil, errors.New("typst: compiler is closed")
@@ -198,21 +212,21 @@ func (c *Compiler) compile(source []byte, opts []CompileOption) (*Document, erro
 	}
 
 	// Prepare C pointers for root.
+	// Use unsafe.StringData to avoid []byte(string) copy allocations —
+	// the Rust side only reads these during the call.
 	var rootPtr *C.uint8_t
 	var rootLen C.size_t
 	if cfg.root != "" {
-		rootBytes := []byte(cfg.root)
-		rootPtr = (*C.uint8_t)(unsafe.Pointer(&rootBytes[0]))
-		rootLen = C.size_t(len(rootBytes))
+		rootPtr = (*C.uint8_t)(unsafe.Pointer(unsafe.StringData(cfg.root)))
+		rootLen = C.size_t(len(cfg.root))
 	}
 
 	// Prepare C pointers for package dir.
 	var pkgPtr *C.uint8_t
 	var pkgLen C.size_t
 	if cfg.packageDir != "" {
-		pkgBytes := []byte(cfg.packageDir)
-		pkgPtr = (*C.uint8_t)(unsafe.Pointer(&pkgBytes[0]))
-		pkgLen = C.size_t(len(pkgBytes))
+		pkgPtr = (*C.uint8_t)(unsafe.Pointer(unsafe.StringData(cfg.packageDir)))
+		pkgLen = C.size_t(len(cfg.packageDir))
 	}
 
 	result := C.typst_world_compile(
@@ -226,11 +240,13 @@ func (c *Compiler) compile(source []byte, opts []CompileOption) (*Document, erro
 	)
 
 	if result.error != 0 {
+		// Copy error message to Go memory and free the Rust-allocated buffer.
 		msg := C.GoBytes(unsafe.Pointer(result.data), C.int(result.len))
 		C.typst_free_result(result.data, result.len)
 		return nil, &CompileError{Message: string(msg)}
 	}
 
+	// Wrap the Rust-allocated PDF pointer in a Document; finalizer guards against leak.
 	doc := &Document{
 		data: result.data,
 		len:  result.len,
@@ -247,6 +263,7 @@ func (c *Compiler) Close() error {
 	return nil
 }
 
+// free releases the Rust compiler. Idempotent via sync.Once.
 func (c *Compiler) free() {
 	c.once.Do(func() {
 		if c.world != nil {
@@ -265,11 +282,11 @@ func (c *Compiler) free() {
 // the underlying memory. After Close, all methods return errors and
 // any byte slices previously returned by [Document.Bytes] are invalid.
 type Document struct {
-	data   *C.uint8_t
-	len    C.size_t
-	offset int
-	once   sync.Once
-	closed bool
+	data   *C.uint8_t // pointer to Rust-allocated PDF bytes
+	len    C.size_t   // size of the PDF in bytes
+	offset int        // current read position for io.Reader
+	once   sync.Once  // ensures free() runs at most once
+	closed bool       // prevents read/write after Close
 }
 
 // Len returns the size of the PDF in bytes.
@@ -325,6 +342,7 @@ func (d *Document) Close() error {
 	return nil
 }
 
+// free releases the Rust-allocated PDF memory. Idempotent via sync.Once.
 func (d *Document) free() {
 	d.once.Do(func() {
 		if d.data != nil {

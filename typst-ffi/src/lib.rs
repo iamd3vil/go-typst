@@ -1,3 +1,6 @@
+#![allow(private_interfaces)]
+
+use std::fmt::Write;
 use std::path::PathBuf;
 use std::slice;
 
@@ -20,7 +23,9 @@ pub struct SharedResources {
 
 impl SharedResources {
     fn new(custom_font_data: &[&[u8]]) -> Self {
-        let mut fonts = Vec::new();
+        // Pre-allocate: bundled fonts typically yield ~20 faces,
+        // each custom file usually contains 1-4 faces.
+        let mut fonts = Vec::with_capacity(20 + custom_font_data.len() * 4);
 
         // Load bundled fonts.
         for data in typst_assets::fonts() {
@@ -63,6 +68,7 @@ struct SingleSourceWorld<'a> {
     shared: &'a SharedResources,
     source: Source,
     root: Option<PathBuf>,
+    canonical_root: Option<PathBuf>,
     package_cache: Option<PathBuf>,
 }
 
@@ -73,10 +79,13 @@ impl<'a> SingleSourceWorld<'a> {
         root: Option<PathBuf>,
         package_cache: Option<PathBuf>,
     ) -> Self {
+        // Pre-compute canonical root once to avoid repeated canonicalize() in resolve_path.
+        let canonical_root = root.as_ref().and_then(|r| r.canonicalize().ok());
         SingleSourceWorld {
             shared,
             source: Source::new(shared.main_id, source_text),
             root,
+            canonical_root,
             package_cache,
         }
     }
@@ -85,33 +94,43 @@ impl<'a> SingleSourceWorld<'a> {
     fn resolve_path(&self, id: FileId) -> FileResult<PathBuf> {
         let vpath = id.vpath().as_rootless_path();
 
-        let base = if let Some(pkg) = id.package() {
+        let (base, canonical_base) = if let Some(pkg) = id.package() {
             // Package file: {cache}/{namespace}/{name}/{version}/
-            let cache = self.package_cache.as_ref().ok_or_else(|| {
-                FileError::NotFound(vpath.into())
-            })?;
-            cache
+            let cache = self
+                .package_cache
+                .as_ref()
+                .ok_or_else(|| FileError::NotFound(vpath.into()))?;
+            let b = cache
                 .join(pkg.namespace.as_str())
                 .join(pkg.name.as_str())
-                .join(pkg.version.to_string())
+                .join(pkg.version.to_string());
+            let cb = b
+                .canonicalize()
+                .map_err(|_| FileError::NotFound(vpath.into()))?;
+            (b, cb)
         } else {
             // Local file: resolve relative to root.
-            self.root.as_ref().ok_or_else(|| {
-                FileError::NotFound(vpath.into())
-            })?.clone()
+            let b = self
+                .root
+                .as_ref()
+                .ok_or_else(|| FileError::NotFound(vpath.into()))?
+                .clone();
+            let cb = self
+                .canonical_root
+                .as_ref()
+                .ok_or_else(|| FileError::NotFound(vpath.into()))?
+                .clone();
+            (b, cb)
         };
 
         let full = base.join(vpath);
 
         // Canonicalize to resolve symlinks and ../ components.
-        let canonical = full.canonicalize().map_err(|_| {
-            FileError::NotFound(vpath.into())
-        })?;
+        let canonical = full
+            .canonicalize()
+            .map_err(|_| FileError::NotFound(vpath.into()))?;
 
         // Path traversal protection: ensure resolved path is within base.
-        let canonical_base = base.canonicalize().map_err(|_| {
-            FileError::NotFound(vpath.into())
-        })?;
         if !canonical.starts_with(&canonical_base) {
             return Err(FileError::AccessDenied);
         }
@@ -137,19 +156,16 @@ impl World for SingleSourceWorld<'_> {
         if id == self.source.id() {
             return Ok(self.source.clone());
         }
-
         let path = self.resolve_path(id)?;
-        let text = std::fs::read_to_string(&path).map_err(|_| {
-            FileError::NotFound(id.vpath().as_rootless_path().into())
-        })?;
+        let text = std::fs::read_to_string(&path)
+            .map_err(|_| FileError::NotFound(id.vpath().as_rootless_path().into()))?;
         Ok(Source::new(id, text))
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         let path = self.resolve_path(id)?;
-        let data = std::fs::read(&path).map_err(|_| {
-            FileError::NotFound(id.vpath().as_rootless_path().into())
-        })?;
+        let data = std::fs::read(&path)
+            .map_err(|_| FileError::NotFound(id.vpath().as_rootless_path().into()))?;
         Ok(Bytes::new(data))
     }
 
@@ -267,17 +283,15 @@ pub unsafe extern "C" fn typst_world_compile(
     let world = SingleSourceWorld::new(shared, source_text, root, package_cache);
     let result = typst::compile::<PagedDocument>(&world);
 
-    let warnings: Vec<String> = result
-        .warnings
-        .iter()
-        .map(|w| format!("warning: {}", w.message))
-        .collect();
-
     match result.output {
         Ok(document) => {
-            let options = typst_pdf::PdfOptions::default();
+            let options = typst_pdf::PdfOptions {
+                tagged: false,
+                ..typst_pdf::PdfOptions::default()
+            };
             match typst_pdf::pdf(&document, &options) {
                 Ok(pdf_bytes) => {
+                    // Leak the PDF bytes into C-owned memory; Go will free via typst_free_result.
                     let mut boxed = pdf_bytes.into_boxed_slice();
                     let ptr = boxed.as_mut_ptr();
                     let len = boxed.len();
@@ -289,26 +303,25 @@ pub unsafe extern "C" fn typst_world_compile(
                     }
                 }
                 Err(errors) => {
-                    let mut msg = String::new();
-                    for w in &warnings {
-                        msg.push_str(w);
-                        msg.push('\n');
+                    let mut msg =
+                        String::with_capacity((result.warnings.len() + errors.len()) * 64);
+                    for w in result.warnings.iter() {
+                        let _ = write!(msg, "warning: {}\n", w.message);
                     }
                     for err in errors.iter() {
-                        msg.push_str(&format!("pdf export error: {}\n", err.message));
+                        let _ = write!(msg, "pdf export error: {}\n", err.message);
                     }
                     make_error(msg)
                 }
             }
         }
         Err(errors) => {
-            let mut msg = String::new();
-            for w in &warnings {
-                msg.push_str(w);
-                msg.push('\n');
+            let mut msg = String::with_capacity((result.warnings.len() + errors.len()) * 64);
+            for w in result.warnings.iter() {
+                let _ = write!(msg, "warning: {}\n", w.message);
             }
             for err in errors.iter() {
-                msg.push_str(&format!("compile error: {}\n", err.message));
+                let _ = write!(msg, "compile error: {}\n", err.message);
             }
             make_error(msg)
         }
@@ -333,10 +346,13 @@ pub unsafe extern "C" fn typst_world_free(world: *mut TypstWorld) {
 #[no_mangle]
 pub unsafe extern "C" fn typst_free_result(data: *mut u8, len: usize) {
     if !data.is_null() && len > 0 {
+        // Reconstruct the Vec from the leaked pointer and drop it to free the memory.
         let _ = unsafe { Vec::from_raw_parts(data, len, len) };
     }
 }
 
+/// Convert an error message into a TypstResult with error flag set.
+/// The message bytes are leaked into C-owned memory for Go to read and free.
 fn make_error(msg: String) -> TypstResult {
     let mut bytes = msg.into_bytes().into_boxed_slice();
     let ptr = bytes.as_mut_ptr();

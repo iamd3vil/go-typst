@@ -1,3 +1,5 @@
 module github.com/sarat/go-typst
 
-go 1.25.5
+go 1.26
+
+toolchain go1.26.0
