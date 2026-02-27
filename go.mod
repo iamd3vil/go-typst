@@ -1,4 +1,4 @@
-module github.com/sarat/go-typst
+module github.com/iamd3vil/go-typst
 
 go 1.26
 

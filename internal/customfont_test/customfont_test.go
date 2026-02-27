@@ -8,7 +8,7 @@ import (
 	"runtime"
 	"testing"
 
-	typst "github.com/sarat/go-typst"
+	typst "github.com/iamd3vil/go-typst"
 )
 
 var (

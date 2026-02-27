@@ -33,7 +33,7 @@ import (
 	"os"
 	"strings"
 
-	typst "github.com/sarat/go-typst"
+	typst "github.com/iamd3vil/go-typst"
 )
 
 func main() {
