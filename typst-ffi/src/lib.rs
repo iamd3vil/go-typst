@@ -1,17 +1,22 @@
 #![allow(private_interfaces)]
 
 use std::fmt::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::slice;
+
+use tikv_jemallocator::Jemalloc;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: Jemalloc = Jemalloc;
 
 use chrono::{Datelike, Local};
 use typst::diag::{FileError, FileResult};
-use typst::foundations::{Bytes, Datetime};
-use typst::layout::PagedDocument;
-use typst::syntax::{FileId, Source, VirtualPath};
+use typst::foundations::{Bytes, Datetime, Duration};
+use typst::syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot};
 use typst::text::{Font, FontBook};
 use typst::utils::LazyHash;
 use typst::{Library, LibraryExt, World};
+use typst_layout::PagedDocument;
 
 /// Shared, immutable resources owned by a compiler instance.
 pub struct SharedResources {
@@ -58,7 +63,10 @@ impl SharedResources {
             library: LazyHash::new(Library::default()),
             book: LazyHash::new(book),
             fonts,
-            main_id: FileId::new(None, VirtualPath::new("/main.typ")),
+            main_id: FileId::new(RootedPath::new(
+                VirtualRoot::Project,
+                VirtualPath::new("/main.typ").expect("valid virtual main path"),
+            )),
         }
     }
 }
@@ -92,43 +100,46 @@ impl<'a> SingleSourceWorld<'a> {
 
     /// Resolve a FileId to an absolute path on disk, with path traversal protection.
     fn resolve_path(&self, id: FileId) -> FileResult<PathBuf> {
-        let vpath = id.vpath().as_rootless_path();
+        let vpath = id.vpath().get_without_slash();
 
-        let (base, canonical_base) = if let Some(pkg) = id.package() {
-            // Package file: {cache}/{namespace}/{name}/{version}/
-            let cache = self
-                .package_cache
-                .as_ref()
-                .ok_or_else(|| FileError::NotFound(vpath.into()))?;
-            let b = cache
-                .join(pkg.namespace.as_str())
-                .join(pkg.name.as_str())
-                .join(pkg.version.to_string());
-            let cb = b
-                .canonicalize()
-                .map_err(|_| FileError::NotFound(vpath.into()))?;
-            (b, cb)
-        } else {
-            // Local file: resolve relative to root.
-            let b = self
-                .root
-                .as_ref()
-                .ok_or_else(|| FileError::NotFound(vpath.into()))?
-                .clone();
-            let cb = self
-                .canonical_root
-                .as_ref()
-                .ok_or_else(|| FileError::NotFound(vpath.into()))?
-                .clone();
-            (b, cb)
+        let (base, canonical_base) = match id.root() {
+            VirtualRoot::Package(pkg) => {
+                // Package file: {cache}/{namespace}/{name}/{version}/
+                let cache = self
+                    .package_cache
+                    .as_ref()
+                    .ok_or_else(|| FileError::NotFound(PathBuf::from(vpath)))?;
+                let b = cache
+                    .join(pkg.namespace.as_str())
+                    .join(pkg.name.as_str())
+                    .join(pkg.version.to_string());
+                let cb = b
+                    .canonicalize()
+                    .map_err(|_| FileError::NotFound(PathBuf::from(vpath)))?;
+                (b, cb)
+            }
+            VirtualRoot::Project => {
+                // Local file: resolve relative to root.
+                let b = self
+                    .root
+                    .as_ref()
+                    .ok_or_else(|| FileError::NotFound(PathBuf::from(vpath)))?
+                    .clone();
+                let cb = self
+                    .canonical_root
+                    .as_ref()
+                    .ok_or_else(|| FileError::NotFound(PathBuf::from(vpath)))?
+                    .clone();
+                (b, cb)
+            }
         };
 
-        let full = base.join(vpath);
+        let full = base.join(Path::new(vpath));
 
         // Canonicalize to resolve symlinks and ../ components.
         let canonical = full
             .canonicalize()
-            .map_err(|_| FileError::NotFound(vpath.into()))?;
+            .map_err(|_| FileError::NotFound(PathBuf::from(vpath)))?;
 
         // Path traversal protection: ensure resolved path is within base.
         if !canonical.starts_with(&canonical_base) {
@@ -158,14 +169,14 @@ impl World for SingleSourceWorld<'_> {
         }
         let path = self.resolve_path(id)?;
         let text = std::fs::read_to_string(&path)
-            .map_err(|_| FileError::NotFound(id.vpath().as_rootless_path().into()))?;
+            .map_err(|_| FileError::NotFound(PathBuf::from(id.vpath().get_without_slash())))?;
         Ok(Source::new(id, text))
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
         let path = self.resolve_path(id)?;
         let data = std::fs::read(&path)
-            .map_err(|_| FileError::NotFound(id.vpath().as_rootless_path().into()))?;
+            .map_err(|_| FileError::NotFound(PathBuf::from(id.vpath().get_without_slash())))?;
         Ok(Bytes::new(data))
     }
 
@@ -173,13 +184,13 @@ impl World for SingleSourceWorld<'_> {
         self.shared.fonts.get(index).cloned()
     }
 
-    fn today(&self, offset: Option<i64>) -> Option<Datetime> {
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
         let now = Local::now();
         let naive = match offset {
             None => now.naive_local(),
             Some(o) => {
                 let utc = now.naive_utc();
-                utc + chrono::Duration::hours(o)
+                utc + chrono::Duration::seconds(o.seconds() as i64)
             }
         };
         Datetime::from_ymd(
@@ -188,6 +199,15 @@ impl World for SingleSourceWorld<'_> {
             naive.day().try_into().ok()?,
         )
     }
+}
+
+/// Clear Typst's process-global memoization caches after each FFI compile.
+///
+/// The CLI gets this for free because each `typst compile` exits. In a long-lived
+/// Go process, the Typst/comemo caches would otherwise retain entries for every
+/// mostly-unique document source compiled by the worker.
+fn evict_typst_caches() {
+    comemo::evict(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +316,7 @@ pub unsafe extern "C" fn typst_world_compile(
                     let ptr = boxed.as_mut_ptr();
                     let len = boxed.len();
                     std::mem::forget(boxed);
+                    evict_typst_caches();
                     TypstResult {
                         data: ptr,
                         len,
@@ -311,6 +332,7 @@ pub unsafe extern "C" fn typst_world_compile(
                     for err in errors.iter() {
                         let _ = write!(msg, "pdf export error: {}\n", err.message);
                     }
+                    evict_typst_caches();
                     make_error(msg)
                 }
             }
@@ -323,6 +345,7 @@ pub unsafe extern "C" fn typst_world_compile(
             for err in errors.iter() {
                 let _ = write!(msg, "compile error: {}\n", err.message);
             }
+            evict_typst_caches();
             make_error(msg)
         }
     }
