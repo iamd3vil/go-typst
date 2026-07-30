@@ -217,6 +217,40 @@ fn evict_typst_caches() {
 /// Opaque handle to a compiler instance.
 pub type TypstWorld = SharedResources;
 
+/// Write a PDF structure tree (Tagged PDF) for a baseline of accessibility.
+/// Keep in sync with `TYPST_FLAG_TAGGED` in typst_ffi.h.
+const FLAG_TAGGED: u32 = 1 << 0;
+
+/// Enforce conformance with PDF/UA-1. Implies [`FLAG_TAGGED`].
+/// Keep in sync with `TYPST_FLAG_PDF_UA_1` in typst_ffi.h.
+const FLAG_PDF_UA_1: u32 = 1 << 1;
+
+/// Build the PDF export options for the given compile flags.
+///
+/// Returns an error message if the requested standards are not a valid
+/// combination. `PdfStandards::new` is fallible, and this crate is built with
+/// `panic = "abort"`, so unwrapping would take down the host Go process.
+fn pdf_options(flags: u32) -> Result<typst_pdf::PdfOptions, String> {
+    let ua_1 = flags & FLAG_PDF_UA_1 != 0;
+
+    // PDF/UA mandates a structure tree, so requesting it implies tagging.
+    // Without this, krilla reports a `MissingTagging` validation error.
+    let tagged = ua_1 || flags & FLAG_TAGGED != 0;
+
+    let standards = if ua_1 {
+        typst_pdf::PdfStandards::new(&[typst_pdf::PdfStandard::Ua_1])
+            .map_err(|e| format!("invalid PDF standards: {}", e.message()))?
+    } else {
+        typst_pdf::PdfStandards::default()
+    };
+
+    Ok(typst_pdf::PdfOptions {
+        tagged,
+        standards,
+        ..typst_pdf::PdfOptions::default()
+    })
+}
+
 /// Result from compilation.
 #[repr(C)]
 pub struct TypstResult {
@@ -259,6 +293,7 @@ pub unsafe extern "C" fn typst_world_new(
 /// - `source_ptr` must point to `source_len` valid UTF-8 bytes.
 /// - `root_ptr`/`root_len`: optional root directory for local file resolution (NULL/0 = disabled).
 /// - `pkg_ptr`/`pkg_len`: optional package cache directory (NULL/0 = disabled).
+/// - `flags`: bitwise OR of the `FLAG_*` constants (0 = untagged, no standard enforced).
 /// - Free the result with `typst_free_result`.
 #[no_mangle]
 pub unsafe extern "C" fn typst_world_compile(
@@ -269,8 +304,15 @@ pub unsafe extern "C" fn typst_world_compile(
     root_len: usize,
     pkg_ptr: *const u8,
     pkg_len: usize,
+    flags: u32,
 ) -> TypstResult {
     let shared = unsafe { &*world };
+
+    // Validate the export configuration before doing any compilation work.
+    let options = match pdf_options(flags) {
+        Ok(options) => options,
+        Err(msg) => return make_error(msg),
+    };
 
     let source_bytes = unsafe { slice::from_raw_parts(source_ptr, source_len) };
     let source_text = match std::str::from_utf8(source_bytes) {
@@ -305,10 +347,6 @@ pub unsafe extern "C" fn typst_world_compile(
 
     match result.output {
         Ok(document) => {
-            let options = typst_pdf::PdfOptions {
-                tagged: false,
-                ..typst_pdf::PdfOptions::default()
-            };
             match typst_pdf::pdf(&document, &options) {
                 Ok(pdf_bytes) => {
                     // Leak the PDF bytes into C-owned memory; Go will free via typst_free_result.
@@ -331,6 +369,11 @@ pub unsafe extern "C" fn typst_world_compile(
                     }
                     for err in errors.iter() {
                         let _ = write!(msg, "pdf export error: {}\n", err.message);
+                        // Standards validation errors (e.g. PDF/UA-1 requiring a
+                        // document title) carry the actionable part in the hints.
+                        for hint in err.hints.iter() {
+                            let _ = write!(msg, "  hint: {}\n", hint.v);
+                        }
                     }
                     evict_typst_caches();
                     make_error(msg)

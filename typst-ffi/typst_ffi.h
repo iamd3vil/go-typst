@@ -19,13 +19,24 @@ typedef struct {
 // Returns a heap-allocated handle. Free with typst_world_free.
 TypstWorld *typst_world_new(const uint8_t **font_ptrs, const size_t *font_lens, size_t font_count);
 
+// Compile flags (bitmask). Keep in sync with the constants in src/lib.rs.
+//
+// TYPST_FLAG_TAGGED   : write a PDF structure tree (Tagged PDF) for a baseline
+//                       of accessibility.
+// TYPST_FLAG_PDF_UA_1 : enforce conformance with PDF/UA-1. Implies
+//                       TYPST_FLAG_TAGGED, since PDF/UA requires tagging.
+#define TYPST_FLAG_TAGGED   (1u << 0)
+#define TYPST_FLAG_PDF_UA_1 (1u << 1)
+
 // Compile a Typst source string to PDF.
 // root_ptr/root_len: optional root directory for local file resolution (NULL/0 = disabled).
 // pkg_ptr/pkg_len: optional package cache directory (NULL/0 = disabled).
+// flags: bitwise OR of TYPST_FLAG_* (0 = untagged PDF 1.7, no standard enforced).
 TypstResult typst_world_compile(const TypstWorld *world,
     const uint8_t *source_ptr, size_t source_len,
     const uint8_t *root_ptr, size_t root_len,
-    const uint8_t *pkg_ptr, size_t pkg_len);
+    const uint8_t *pkg_ptr, size_t pkg_len,
+    uint32_t flags);
 
 // Free a compiler instance.
 void typst_world_free(TypstWorld *world);

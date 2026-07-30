@@ -7,10 +7,10 @@ edition = "2021"
 crate-type = ["staticlib"]
 
 [dependencies]
-typst = "0.15"
-typst-pdf = "0.15"
-typst-layout = "0.15"
-typst-assets = { version = "0.15", features = ["fonts"] }
+typst = "0.15.1"
+typst-pdf = "0.15.1"
+typst-layout = "0.15.1"
+typst-assets = { version = "0.15.1", features = ["fonts"] }
 chrono = "0.4"
 comemo = "0.5"
 tikv-jemallocator = "0.6"

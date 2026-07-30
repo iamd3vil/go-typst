@@ -340,6 +340,116 @@ func TestPackage_CompileFile(t *testing.T) {
 	}
 }
 
+// accessibleSource is a document that satisfies the PDF/UA-1 requirements:
+// it has a title, and its only figure carries alt text.
+const accessibleSource = `#set document(title: [Accessible Report])
+
+= Overview
+
+Body text with a #link("https://typst.app")[link].
+
+#image("logo.png", alt: "The project logo")
+`
+
+func TestCompile_defaultIsUntagged(t *testing.T) {
+	c := newTestCompiler(t)
+	doc, err := c.CompileBytes([]byte(accessibleSource), WithRoot(testdataDir(t)))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer doc.Close()
+
+	if bytes.Contains(doc.Bytes(), []byte("StructTreeRoot")) {
+		t.Error("default output should not contain a structure tree")
+	}
+}
+
+func TestCompile_WithTaggedPDF(t *testing.T) {
+	c := newTestCompiler(t)
+	doc, err := c.CompileBytes([]byte(accessibleSource), WithRoot(testdataDir(t)), WithTaggedPDF())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer doc.Close()
+
+	b := doc.Bytes()
+	if !bytes.HasPrefix(b, []byte("%PDF-")) {
+		t.Fatal("output does not look like a PDF")
+	}
+	for _, marker := range []string{"StructTreeRoot", "MarkInfo", "/Marked"} {
+		if !bytes.Contains(b, []byte(marker)) {
+			t.Errorf("tagged output is missing %q", marker)
+		}
+	}
+	if bytes.Contains(b, []byte("pdfuaid")) {
+		t.Error("tagged output should not claim PDF/UA conformance")
+	}
+}
+
+func TestCompile_WithPDFUA1(t *testing.T) {
+	c := newTestCompiler(t)
+	doc, err := c.CompileBytes([]byte(accessibleSource), WithRoot(testdataDir(t)), WithPDFUA1())
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer doc.Close()
+
+	b := doc.Bytes()
+	if !bytes.HasPrefix(b, []byte("%PDF-")) {
+		t.Fatal("output does not look like a PDF")
+	}
+	// The XMP metadata must declare PDF/UA-1 conformance, and PDF/UA implies
+	// tagging even though WithTaggedPDF was not passed.
+	for _, marker := range []string{"pdfuaid", "StructTreeRoot"} {
+		if !bytes.Contains(b, []byte(marker)) {
+			t.Errorf("PDF/UA-1 output is missing %q", marker)
+		}
+	}
+}
+
+func TestCompile_WithPDFUA1_missingTitle(t *testing.T) {
+	c := newTestCompiler(t)
+	_, err := c.CompileBytes([]byte("= Heading\n\nNo document title set.\n"), WithPDFUA1())
+	if err == nil {
+		t.Fatal("expected error for PDF/UA-1 export without a document title")
+	}
+	var ce *CompileError
+	if !asCompileError(err, &ce) {
+		t.Fatalf("expected CompileError, got %T: %v", err, err)
+	}
+	if !strings.Contains(ce.Message, "missing document title") {
+		t.Errorf("error should name the missing requirement, got: %q", ce.Message)
+	}
+	if !strings.Contains(ce.Message, "hint:") {
+		t.Errorf("error should carry the actionable hint, got: %q", ce.Message)
+	}
+}
+
+func TestCompile_WithPDFUA1_missingAltText(t *testing.T) {
+	c := newTestCompiler(t)
+	source := []byte("#set document(title: [T])\n#image(\"logo.png\")\n")
+	_, err := c.CompileBytes(source, WithRoot(testdataDir(t)), WithPDFUA1())
+	if err == nil {
+		t.Fatal("expected error for PDF/UA-1 export with an image lacking alt text")
+	}
+	if !strings.Contains(err.Error(), "alt text") {
+		t.Errorf("error should mention alt text, got: %q", err.Error())
+	}
+}
+
+func TestCompileFile_WithPDFUA1(t *testing.T) {
+	c := newTestCompiler(t)
+	doc, err := c.CompileFile("testdata/accessible.typ", WithPDFUA1())
+	if err != nil {
+		t.Fatalf("CompileFile with WithPDFUA1 failed: %v", err)
+	}
+	defer doc.Close()
+
+	if !bytes.Contains(doc.Bytes(), []byte("pdfuaid")) {
+		t.Error("PDF/UA-1 output is missing the pdfuaid XMP marker")
+	}
+}
+
 func asCompileError(err error, target **CompileError) bool {
 	if ce, ok := err.(*CompileError); ok {
 		*target = ce

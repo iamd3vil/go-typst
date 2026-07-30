@@ -1,11 +1,12 @@
 # go-typst
 
-A Go library for compiling [Typst](https://typst.app) markup into PDF, powered by the Typst Rust crate (v0.14) via CGO.
+A Go library for compiling [Typst](https://typst.app) markup into PDF, powered by the Typst Rust crate (v0.15.1) via CGO.
 
 - **Zero-copy output** — PDF bytes stay in Rust memory, never copied to the Go heap.
 - **Instance-based** — each `Compiler` has its own fonts and caches, safe for concurrent use.
 - **Custom fonts** — load any TTF/OTF when creating a `Compiler`, alongside the bundled defaults.
 - **File & import support** — `#import`, `#image()`, and 3rd-party packages work via `WithRoot` and `WithPackageDir` options.
+- **Accessibility** — opt into Tagged PDF or full PDF/UA-1 conformance with `WithTaggedPDF` / `WithPDFUA1`.
 
 ## Prerequisites
 
@@ -119,6 +120,42 @@ source := []byte(`#image("logo.png")`)
 doc, _ := c.CompileBytes(source, typst.WithRoot("/path/to/assets"))
 ```
 
+### Accessibility: Tagged PDF & PDF/UA-1
+
+By default the PDF is untagged — the smallest, fastest output. Accessibility is
+opt-in per compilation:
+
+```go
+// Tagged PDF: writes a structure tree (headings, lists, tables, links,
+// figures) so screen readers can navigate the document semantically.
+doc, err := c.CompileBytes(source, typst.WithTaggedPDF())
+
+// PDF/UA-1 (ISO 14289-1): tagging plus conformance validation and the
+// pdfuaid XMP marker. Implies WithTaggedPDF.
+doc, err = c.CompileBytes(source, typst.WithPDFUA1())
+```
+
+`WithPDFUA1` makes Typst validate the document during export, so a document
+that cannot conform fails to compile:
+
+```go
+_, err := c.CompileBytes([]byte("= Heading\n\nNo title."), typst.WithPDFUA1())
+// err: pdf export error: PDF/UA-1 error: missing document title
+//        hint: set the title with `set document(title: [...])`
+```
+
+To satisfy PDF/UA-1, the source must set a document title and give every image
+and equation alt text:
+
+```typst
+#set document(title: [Accessible Report])
+#set text(lang: "en")
+
+= Introduction
+
+#image("logo.png", alt: "The project logo")
+```
+
 ### Multiple Independent Compilers
 
 ```go
@@ -158,10 +195,14 @@ A `Compiler` is safe for concurrent use from multiple goroutines.
 ```go
 func WithRoot(dir string) CompileOption
 func WithPackageDir(dir string) CompileOption
+func WithTaggedPDF() CompileOption
+func WithPDFUA1() CompileOption
 ```
 
 - **`WithRoot(dir)`** — sets the root directory for resolving `#import` and `#image()` paths. Path traversal outside the root is blocked.
 - **`WithPackageDir(dir)`** — overrides the default package cache directory. Packages are resolved at `{dir}/{namespace}/{name}/{version}/`.
+- **`WithTaggedPDF()`** — writes a PDF structure tree (Tagged PDF) for a baseline of accessibility. Off by default: it makes the output larger and slower to produce.
+- **`WithPDFUA1()`** — enforces PDF/UA-1 (ISO 14289-1) conformance; implies `WithTaggedPDF()`. Export fails with a `*CompileError` (message plus hints) if the document cannot conform — e.g. a missing document title or missing image alt text.
 
 ### `func DefaultPackageDir() string`
 
@@ -285,4 +326,5 @@ make test
 
 - **No automatic package download**: packages must already be in the cache (e.g. installed via the `typst` CLI). This library resolves packages from the local filesystem only.
 - **Fonts fixed at creation**: fonts are loaded once when the `Compiler` is created via `New()` and cannot be changed afterwards.
+- **One PDF standard exposed**: of the standards Typst can enforce, only PDF/UA-1 is wired through (see `WithPDFUA1`). The PDF/A family is not exposed.
 - **macOS/Linux**: tested on macOS (arm64) and Linux (amd64).

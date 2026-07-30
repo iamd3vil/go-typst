@@ -35,6 +35,7 @@ type CompileOption func(*compileConfig)
 type compileConfig struct {
 	root       string // directory for resolving #import and #image paths
 	packageDir string // directory for resolving @preview/... package imports
+	flags      C.uint32_t
 }
 
 // WithRoot sets the root directory for resolving local file imports and images.
@@ -51,6 +52,35 @@ func WithRoot(dir string) CompileOption {
 func WithPackageDir(dir string) CompileOption {
 	return func(cfg *compileConfig) {
 		cfg.packageDir = dir
+	}
+}
+
+// WithTaggedPDF writes a PDF structure tree (Tagged PDF) into the output,
+// providing a baseline of accessibility for screen readers: headings, lists,
+// tables, links and figures are exposed as semantic structure elements.
+//
+// Tagging is off by default because it makes the output larger and slower to
+// produce. Use [WithPDFUA1] instead if you need full PDF/UA-1 conformance.
+func WithTaggedPDF() CompileOption {
+	return func(cfg *compileConfig) {
+		cfg.flags |= C.TYPST_FLAG_TAGGED
+	}
+}
+
+// WithPDFUA1 enforces conformance with PDF/UA-1 (ISO 14289-1), the accessible
+// PDF standard. It implies [WithTaggedPDF].
+//
+// Typst validates the document during export and compilation fails if it
+// cannot conform. The document must therefore:
+//
+//   - set a title: #set document(title: [My Report])
+//   - give every image and equation alt text: #image("x.png", alt: "...")
+//
+// On failure the returned error is a [CompileError] whose message names the
+// missing requirement, along with hints on how to fix it.
+func WithPDFUA1() CompileOption {
+	return func(cfg *compileConfig) {
+		cfg.flags |= C.TYPST_FLAG_PDF_UA_1
 	}
 }
 
@@ -237,6 +267,7 @@ func (c *Compiler) compile(source []byte, opts []CompileOption) (*Document, erro
 		rootLen,
 		pkgPtr,
 		pkgLen,
+		cfg.flags,
 	)
 
 	if result.error != 0 {

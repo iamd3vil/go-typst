@@ -1,0 +1,66 @@
+name: Release native Typst FFI static library
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  linux-amd64:
+    name: Build Linux amd64 static library
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: typst-ffi
+
+      - name: Build release static library
+        run: cargo build --release --manifest-path typst-ffi/Cargo.toml
+
+      - name: Package native library
+        run: |
+          set -euxo pipefail
+          mkdir -p dist/go-typst-typst-ffi-linux-amd64
+          cp typst-ffi/target/release/libtypst_ffi.a dist/go-typst-typst-ffi-linux-amd64/
+          cp typst-ffi/typst_ffi.h dist/go-typst-typst-ffi-linux-amd64/
+          cat > dist/go-typst-typst-ffi-linux-amd64/README.txt <<'EOF'
+          Native Typst FFI static library for go-typst on Linux amd64.
+
+          Files:
+          - libtypst_ffi.a: static library linked into Go binaries.
+          - typst_ffi.h: C header used by cgo.
+
+          To use without Rust, copy libtypst_ffi.a into:
+            typst-ffi/target/release/libtypst_ffi.a
+
+          Then build with CGO enabled and a C compiler installed:
+            CGO_ENABLED=1 go build ./...
+
+          The final Go binary is standalone; this archive is only needed at build time.
+          No Rust toolchain is required when using this prebuilt library.
+          EOF
+          tar -C dist -czf go-typst-typst-ffi-linux-amd64.tar.gz go-typst-typst-ffi-linux-amd64
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: go-typst-typst-ffi-linux-amd64
+          path: go-typst-typst-ffi-linux-amd64.tar.gz
+          if-no-files-found: error
+
+      - name: Upload release asset
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: go-typst-typst-ffi-linux-amd64.tar.gz
